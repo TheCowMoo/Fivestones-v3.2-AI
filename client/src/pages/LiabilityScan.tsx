@@ -1,0 +1,809 @@
+import { useState, useMemo, useCallback, useEffect } from "react";
+// liabilityScanScoring removed — risk level is now derived directly from assessmentEngine classification
+import { useLocation } from "wouter";
+import { BackNavigation } from "@/components/BackNavigation";
+import { trpc } from "@/lib/trpc";
+import { useAuth } from "@/_core/hooks/useAuth";
+import { toast } from "sonner";
+import {
+  QUESTIONS,
+  CATEGORY_LABELS,
+  getJurisdictionRegulatoryBasis,
+  type AnswerValue,
+  type CategoryKey,
+  type AssessmentOutput,
+  type QuestionOption,
+} from "../../../shared/assessmentEngine";
+import { US_STATES, ONTARIO_PROVINCES } from "../../../shared/stateProvinces";
+import { INDUSTRY_LIST } from "../../../shared/industryOverlayContent";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  ShieldAlert,
+  CheckCircle2,
+  XCircle,
+  RotateCcw,
+  ClipboardList,
+  FileText,
+  Users,
+  Zap,
+  MapPin,
+  Building2,
+  Loader2,
+} from "lucide-react";
+
+// --- Assessment component library ---
+import {
+  HeroScoreCard,
+  RiskMapBar,
+  CategoryBreakdownSection,
+  LiabilityGapsSection,
+  ActionPlanSection,
+  InterpretationCard,
+  AdvisorInsightCard,
+  ServiceCardsSection,
+  FinalCTABanner,
+} from "@/components/assessment";
+import type { GapItem } from "@/components/assessment";
+
+// --- Session persistence ---
+import {
+  saveScanSession,
+  saveScanId,
+  markPlanVisited,
+  loadScanSession,
+  clearScanSession,
+} from "@/lib/scanSession";
+import {
+  Accordion,
+  AccordionItem,
+  AccordionTrigger,
+  AccordionContent,
+} from "@/components/ui/accordion";
+
+// --- Category display order ---
+// reporting_communication now includes q8, q9, q10 (RAS), q16 (Anonymous Reporting)
+const CATEGORY_ORDER: CategoryKey[] = [
+  "planning_documentation",
+  "training_awareness",
+  "reporting_communication",
+  "response_readiness",
+  "critical_risk_factors",
+];
+
+// --- Main page ---
+export default function LiabilityScan() {
+  const [, navigate] = useLocation();
+  const { user } = useAuth();
+
+  // --- Restore from sessionStorage on mount ---
+  const session = useMemo(() => loadScanSession(), []);
+
+  const [jurisdiction, setJurisdiction] = useState(session.jurisdiction);
+  const [industry, setIndustry] = useState(session.industry);
+  const [answers, setAnswers] = useState<Record<string, AnswerValue>>(session.answers);
+  const [result, setResult] = useState<AssessmentOutput | null>(session.result);
+  // Risk level is derived from result.classification — no separate scoring system
+  const [savedScanId, setSavedScanId] = useState<number | null>(session.scanId);
+
+  const [scanLoadingDialogOpen, setScanLoadingDialogOpen] = useState(false);
+
+  // Scroll to results if restoring a completed scan
+  useEffect(() => {
+    if (session.result) {
+      setTimeout(() => {
+        document.getElementById("scan-results")?.scrollIntoView({ behavior: "smooth" });
+      }, 150);
+    }
+    // Only run on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist engine-based classification to DB once scan is saved
+  const updateTierScoresMutation = trpc.liabilityScan.updateTierScores.useMutation();
+  useEffect(() => {
+    if (!user || !savedScanId || !result) return;
+    const classToStatus = (c: string) =>
+      c === "Severe Exposure" ? "Critical Risk"
+      : c === "High Exposure" ? "High Risk"
+      : c === "Moderate Exposure" ? "Moderate Risk"
+      : "Low Risk";
+    updateTierScoresMutation.mutate({
+      scanId: savedScanId,
+      scorePercent: result.score,
+      defensibilityStatus: classToStatus(result.classification),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savedScanId, result]);
+
+  const saveScanMutation = trpc.liabilityScan.save.useMutation({
+    onSuccess: (data) => {
+      setSavedScanId(data.scanId);
+      saveScanId(data.scanId);
+      // Scan is persisted in DB — user can re-view results from the dashboard at any time.
+    },
+    onError: () => {
+      // Non-blocking: scan still works without persistence
+      console.warn("[LiabilityScan] Failed to persist scan result");
+    },
+  });
+
+  const computeScoreMutation = trpc.liabilityScan.computeScore.useMutation();
+
+
+
+  // Navigate to Defensibility Plan carrying full assessment context
+  const handleDefensibilityPlan = useCallback(() => {
+    if (!result) return;
+    markPlanVisited();
+    // Also push to history.state as a belt-and-suspenders fallback
+    window.history.pushState(
+      { planContext: { result, jurisdiction, industry } },
+      "",
+      "/defensibility-plan"
+    );
+    navigate("/defensibility-plan");
+  }, [result, jurisdiction, industry, navigate]);
+
+  const questionsByCategory = useMemo(() => {
+    const map: Partial<Record<CategoryKey, typeof QUESTIONS>> = {};
+    for (const cat of CATEGORY_ORDER) {
+      map[cat] = QUESTIONS.filter((q) => q.category === cat);
+    }
+    return map;
+  }, []);
+
+  // Build a weight lookup for gap cards
+  const weightById = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const q of QUESTIONS) m[q.id] = q.weight;
+    return m;
+  }, []);
+
+  // Export report as a downloadable PDF via the server-side PDF endpoint
+  const [exportLoading, setExportLoading] = useState(false);
+  const handleExportReport = useCallback(async () => {
+    if (!result) return;
+    setExportLoading(true);
+    try {
+      const payload = {
+        score: result.score,
+        classification: result.classification,
+        riskMapColor: result.riskMap.color,
+        riskMapDescriptor: result.riskMap.descriptor,
+        jurisdiction,
+        industry,
+        topGaps: result.topGaps.map((g) => ({
+          ...g,
+          weight: weightById[g.id] ?? 0,
+        })),
+        interpretation: result.interpretation,
+        advisorSummary: result.advisorSummary,
+        immediateActions: result.immediateActionPlan,
+        scanId: savedScanId ?? undefined,
+        createdAt: Date.now(),
+      };
+      const res = await fetch("/api/liability-scan/pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error("PDF generation failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `FiveStonesWPV_LiabilityScan_${savedScanId ?? "Report"}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast.error("Export failed. Please try again.");
+    } finally {
+      setExportLoading(false);
+    }
+  }, [result, jurisdiction, industry, savedScanId, weightById]);
+
+  const totalAnswered = Object.keys(answers).length;
+  const totalQuestions = QUESTIONS.length;
+  const allAnswered = totalAnswered === totalQuestions;
+
+  function handleAnswer(id: string, value: AnswerValue) {
+    setAnswers((prev) => ({ ...prev, [id]: value }));
+  }
+
+  async function handleRun() {
+    if (!allAnswered) return;
+
+    setScanLoadingDialogOpen(true);
+    try {
+      const output = await computeScoreMutation.mutateAsync({
+        answers,
+        jurisdiction: jurisdiction || "Not specified",
+        industry: industry || "Not specified",
+      });
+
+      setResult(output);
+      setSavedScanId(null);
+      // Persist to sessionStorage immediately so back-navigation restores state
+      saveScanSession({
+        result: output,
+        answers,
+        jurisdiction: jurisdiction || "Not specified",
+        industry: industry || "Not specified",
+        scanId: null,
+      });
+
+      // Auto-save for logged-in users (non-blocking)
+      if (user) {
+        saveScanMutation.mutate({
+          score: output.score,
+          classification: output.classification,
+          riskMapLevel: output.riskMap.label,
+          riskMapColor: output.riskMap.color,
+          riskMapDescriptor: output.riskMap.descriptor,
+          jurisdiction: jurisdiction || "Not specified",
+          industry: industry || "Not specified",
+          topGaps: output.topGaps,
+          categoryBreakdown: output.categoryScores as unknown as Record<string, unknown>,
+          immediateActions: output.immediateActionPlan,
+          interpretation: output.interpretation,
+          advisorSummary: output.advisorSummary,
+          answers,
+        });
+      }
+      setTimeout(() => {
+        document.getElementById("scan-results")?.scrollIntoView({ behavior: "smooth" });
+      }, 100);
+    } catch (error) {
+      console.error("[LiabilityScan] LLM computeScore failed", error);
+      toast.error("Liability scan generation failed. Please try again.");
+    } finally {
+      setScanLoadingDialogOpen(false);
+    }
+  }
+
+  function handleReset() {
+    clearScanSession();
+    setAnswers({});
+    setResult(null);
+    setSavedScanId(null);
+    setShareUrl(null);
+    setJurisdiction("");
+    setIndustry("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // Build enriched gap items for LiabilityGapsSection.
+  // Override regulatoryBasis at render time using the current jurisdiction so that
+  // saved/restored results always show jurisdiction-correct citations.
+  const gapItems: GapItem[] = useMemo(() => {
+    if (!result) return [];
+    const jur = jurisdiction || "Not specified";
+    return result.topGaps.map((gap) => {
+      const dynBasis = getJurisdictionRegulatoryBasis(gap.id, jur);
+      return {
+        ...gap,
+        weight: weightById[gap.id] ?? 0,
+        ...(dynBasis.regulatoryBasis.length > 0 ? { regulatoryBasis: dynBasis.regulatoryBasis } : {}),
+        ...(dynBasis.preparednessBasis.length > 0 ? { preparednessBasis: dynBasis.preparednessBasis } : {}),
+      };
+    });
+  }, [result, weightById, jurisdiction]);
+
+  // Build category data for CategoryBreakdownSection
+  const categoryData = useMemo(() => {
+    if (!result) return [];
+    return [
+      {
+        catKey: "planning_documentation" as CategoryKey,
+        label: CATEGORY_LABELS["planning_documentation"],
+        score: result.categoryScores.planningDocumentation,
+      },
+      {
+        catKey: "training_awareness" as CategoryKey,
+        label: CATEGORY_LABELS["training_awareness"],
+        score: result.categoryScores.trainingAwareness,
+      },
+      {
+        catKey: "reporting_communication" as CategoryKey,
+        label: CATEGORY_LABELS["reporting_communication"],
+        score: result.categoryScores.reportingCommunication,
+      },
+      {
+        catKey: "response_readiness" as CategoryKey,
+        label: CATEGORY_LABELS["response_readiness"],
+        score: result.categoryScores.responseReadiness,
+      },
+    ];
+  }, [result]);
+
+  // Determine whether user has already visited the Defensibility Plan
+  // so we can switch the primary CTA label accordingly
+  const planVisited = session.planVisited;
+
+  // Service cards with anchored navigation to /how-we-help
+  const serviceCards = useMemo(
+    () => [
+      {
+        icon: <ClipboardList className="w-5 h-5" />,
+        title: "Full Liability Assessment",
+        desc: "A structured, on-site evaluation of your organization's exposure across all threat categories, documented for legal and regulatory defensibility.",
+        onCTA: () => navigate("/how-we-help#full-liability-assessment"),
+      },
+      {
+        icon: <FileText className="w-5 h-5" />,
+        title: "Site-Specific Plan Development",
+        desc: "Development of a customized Active Threat Response Plan and Emergency Action Plan aligned to your facility, industry, and jurisdiction.",
+        onCTA: () => navigate("/how-we-help#site-specific-plan-development"),
+      },
+      {
+        icon: <Users className="w-5 h-5" />,
+        title: "Training & Drill Implementation",
+        desc: "Delivery of evidence-based active threat training and facilitated drills, with documentation suitable for post-incident review.",
+        onCTA: () => navigate("/how-we-help#training-drill-implementation"),
+      },
+    ],
+    [navigate]
+  );
+
+  return (
+    <div className="max-w-4xl mx-auto py-10 px-4 space-y-10">
+      {/* ── Back navigation ─────────────────────────────────────────────────── */}
+      <BackNavigation to="/dashboard" label="Back to Dashboard" />
+      {/* ── Page Header ─────────────────────────────────────────────────────── */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-3">
+          <div
+            className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+            style={{ backgroundColor: "#0B1F33" }}
+          >
+            <ShieldAlert className="w-5 h-5 text-white" />
+          </div>
+          <div>
+            <h1
+              className="text-2xl font-bold text-foreground"
+              style={{ fontFamily: "Poppins, Inter, sans-serif" }}
+            >
+              Liability Exposure Scan
+            </h1>
+            <p className="text-muted-foreground text-sm">
+              Identify workplace violence liability gaps and assess your organization's defensibility posture.
+            </p>
+          </div>
+        </div>
+        <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 leading-relaxed">
+          <strong>Disclaimer:</strong> This is a preliminary workplace violence liability scan designed to
+          identify potential gaps and areas of exposure. It is not a formal audit or legal determination of compliance.
+        </div>
+      </div>
+
+      {/* ── Context selectors ───────────────────────────────────────────────── */}
+      <Card className="shadow-sm">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <ClipboardList className="w-4 h-4 text-primary" />
+            Assessment Context
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-muted-foreground" />
+              Jurisdiction
+            </label>
+            <Select value={jurisdiction} onValueChange={setJurisdiction}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select state / province…" />
+              </SelectTrigger>
+              <SelectContent>
+                {US_STATES.map((s) => (
+                  <SelectItem key={s.value} value={s.label}>{s.label}</SelectItem>
+                ))}
+                {ONTARIO_PROVINCES.map((p) => (
+                  <SelectItem key={p.value} value={p.label}>{p.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
+              <Building2 className="w-3.5 h-3.5 text-muted-foreground" />
+              Industry
+            </label>
+            <Select value={industry} onValueChange={setIndustry}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select industry…" />
+              </SelectTrigger>
+              <SelectContent>
+                {INDUSTRY_LIST.map((ind) => (
+                  <SelectItem key={ind.key} value={ind.label}>{ind.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── Question categories ─────────────────────────────────────────────── */}
+      {CATEGORY_ORDER.map((catKey) => {
+        const qs = questionsByCategory[catKey] ?? [];
+        const catAnswered = qs.filter((q) => answers[q.id] !== undefined).length;
+        return (
+          <Card key={catKey} className="shadow-sm">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base flex items-center justify-between">
+                <span style={{ fontFamily: "Poppins, Inter, sans-serif" }}>
+                  {CATEGORY_LABELS[catKey]}
+                </span>
+                <span className="text-xs font-normal text-muted-foreground bg-muted px-2 py-0.5 rounded-full">
+                  {catAnswered}/{qs.length}
+                </span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              {qs.map((q, idx) => {
+                const ans = answers[q.id];
+                return (
+                  <div key={q.id} className="space-y-2.5">
+                    <p className="text-sm font-medium text-foreground leading-snug">
+                      <span className="text-muted-foreground mr-2 font-normal">{idx + 1}.</span>
+                      {q.text}
+                    </p>
+                    {q.options && q.options.length > 0 ? (
+                      // Multi-option question: render as radio button group
+                      <div className="flex flex-col gap-2">
+                        {(q.options as QuestionOption[]).map((opt) => {
+                          const isSelected = ans === opt.value;
+                          const isFullCredit = opt.deductionFraction === 0;
+                          const isNone = opt.deductionFraction === 1;
+                          const selectedColor = isFullCredit
+                            ? "bg-[#22C55E] text-white border-[#22C55E]"
+                            : isNone
+                            ? "bg-[#E5484D] text-white border-[#E5484D]"
+                            : "bg-[#F59E0B] text-white border-[#F59E0B]";
+                          return (
+                            <button
+                              key={opt.value}
+                              onClick={() => handleAnswer(q.id, opt.value)}
+                              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium border transition-all text-left ${
+                                isSelected
+                                  ? `${selectedColor} shadow-sm`
+                                  : "border-border text-muted-foreground hover:border-muted-foreground bg-transparent"
+                              }`}
+                            >
+                              <span className="w-4 h-4 rounded-full border-2 flex-shrink-0 flex items-center justify-center"
+                                style={{
+                                  borderColor: isSelected ? "white" : "currentColor",
+                                  backgroundColor: isSelected ? "white" : "transparent",
+                                }}
+                              >
+                                {isSelected && (
+                                  <span className="w-2 h-2 rounded-full block"
+                                    style={{
+                                      backgroundColor: isFullCredit ? "#22C55E" : isNone ? "#E5484D" : "#F59E0B",
+                                    }}
+                                  />
+                                )}
+                              </span>
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      // Binary yes/no question
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleAnswer(q.id, "yes")}
+                          className={`flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium border transition-all ${
+                            ans === "yes"
+                              ? "bg-[#22C55E] text-white border-[#22C55E] shadow-sm"
+                              : "border-border text-muted-foreground hover:border-[#22C55E] hover:text-[#22C55E]"
+                          }`}
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          Yes
+                        </button>
+                        <button
+                          onClick={() => handleAnswer(q.id, "no")}
+                          className={`flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium border transition-all ${
+                            ans === "no"
+                              ? "bg-[#E5484D] text-white border-[#E5484D] shadow-sm"
+                              : "border-border text-muted-foreground hover:border-[#E5484D] hover:text-[#E5484D]"
+                          }`}
+                        >
+                          <XCircle className="w-3.5 h-3.5" />
+                          No
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </CardContent>
+          </Card>
+        );
+      })}
+
+      {/* ── Progress + Run button ───────────────────────────────────────────── */}
+      <div className="flex items-center justify-between py-2">
+        <div className="space-y-1">
+          <span className="text-sm font-medium text-foreground">
+            {totalAnswered}/{totalQuestions} questions answered
+          </span>
+          <div className="h-1.5 w-48 bg-muted rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all duration-300"
+              style={{
+                width: `${(totalAnswered / totalQuestions) * 100}%`,
+                backgroundColor: "#3A5F7D",
+              }}
+            />
+          </div>
+        </div>
+        <Button
+          onClick={handleRun}
+          disabled={!allAnswered || computeScoreMutation.isPending}
+          size="lg"
+          className="text-white font-semibold shadow-md hover:shadow-lg transition-shadow"
+          style={{ backgroundColor: "#0B1F33" }}
+        >
+          {computeScoreMutation.isPending ? (
+            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+          ) : (
+            <Zap className="w-4 h-4 mr-2" />
+          )}
+          {computeScoreMutation.isPending ? "Running Scan..." : "Run Liability Scan"}
+        </Button>
+      </div>
+
+      <Dialog open={scanLoadingDialogOpen} onOpenChange={setScanLoadingDialogOpen}>
+        <DialogContent showCloseButton={false} className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Generating your liability scan</DialogTitle>
+            <DialogDescription>
+              This can take 30–45 seconds to complete. Please keep this window open while we generate your full scan results.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex items-center justify-center py-4">
+            <Loader2 className="w-12 h-12 animate-spin text-primary" />
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Scan email removed — results are persisted in DB and viewable from dashboard */}
+
+      {/* ══════════════════════════════════════════════════════════════════════ */}
+      {/* RESULTS                                                               */}
+      {/* ══════════════════════════════════════════════════════════════════════ */}
+      {result && (
+        <div id="scan-results" className="space-y-8 pt-6 border-t border-border">
+
+          {/* Results header */}
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <h2
+              className="text-xl font-bold text-foreground flex items-center gap-2"
+              style={{ fontFamily: "Poppins, Inter, sans-serif" }}
+            >
+              <ShieldAlert className="w-5 h-5 text-[#E5484D]" />
+              Scan Results
+            </h2>
+            <div className="flex items-center gap-2">
+
+              <Button variant="outline" size="sm" onClick={handleReset}>
+                <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
+                Start Over
+              </Button>
+            </div>
+          </div>
+
+
+
+          {/* ── Liability Risk Level Banner (engine-driven, single source of truth) ─ */}
+          {(() => {
+            const cls = result.classification;
+            const isLow = cls === "Defensible Position";
+            const isMod = cls === "Moderate Exposure";
+            const isHigh = cls === "High Exposure";
+            // isCritical = Severe Exposure
+            const riskLabel = isLow ? "Low Risk" : isMod ? "Moderate Risk" : isHigh ? "High Risk" : "Critical Risk";
+            const borderCls = isLow ? "border-green-500 bg-green-50 dark:bg-green-950/20"
+              : isMod ? "border-amber-500 bg-amber-50 dark:bg-amber-950/20"
+              : isHigh ? "border-orange-500 bg-orange-50 dark:bg-orange-950/20"
+              : "border-red-700 bg-red-50 dark:bg-red-950/20";
+            const iconCls = isLow ? "text-green-600" : isMod ? "text-amber-600" : isHigh ? "text-orange-600" : "text-red-700";
+            const badgeCls = isLow ? "bg-green-600 text-white" : isMod ? "bg-amber-500 text-white" : isHigh ? "bg-orange-500 text-white" : "bg-red-700 text-white";
+            const descriptor = isLow
+              ? "Your organization demonstrates a strong safety posture with no critical structural failures."
+              : isMod
+              ? "Your organization has moderate liability exposure. Address the identified gaps to strengthen your defensibility."
+              : isHigh
+              ? "Your organization has significant liability exposure. Immediate action is required on the critical gaps identified."
+              : "Your organization has critical liability exposure across multiple structural areas. Urgent remediation is required.";
+            return (
+              <div className={`rounded-xl border-2 p-5 space-y-2 ${borderCls}`}>
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2">
+                    <ShieldAlert className={`w-5 h-5 ${iconCls}`} />
+                    <span className="text-base font-bold" style={{ fontFamily: "Poppins, Inter, sans-serif" }}>
+                      Liability Exposure Score
+                    </span>
+                  </div>
+                  <span className={`text-sm font-bold px-3 py-1 rounded-full ${badgeCls}`}>
+                    {riskLabel}
+                  </span>
+                </div>
+                <p className="text-sm text-muted-foreground">{descriptor}</p>
+              </div>
+            );
+          })()}
+
+          {/* ── Section 1: Hero Score Card ────────────────────────────────────── */}
+          <HeroScoreCard
+            score={result.score}
+            classification={result.classification}
+            riskColor={result.riskMap.color}
+            riskDescriptor={result.riskMap.descriptor}
+            gapCount={result.topGaps.length}
+            jurisdiction={jurisdiction}
+            industry={industry}
+            primaryLabel={planVisited ? "View Defensibility Plan" : "Generate Your Defensibility Plan"}
+            onPrimaryCTA={handleDefensibilityPlan}
+            onSecondaryCTA={handleExportReport}
+          />
+
+          {/* -- Sections 2-7: Collapsible Accordion (all results sections) */}
+          <Accordion
+            type="multiple"
+            defaultValue={["risk-map"]}
+            className="space-y-2"
+          >
+            {/* Risk Map */}
+            <AccordionItem
+              value="risk-map"
+              className="border border-border rounded-xl overflow-hidden shadow-sm"
+            >
+              <AccordionTrigger className="px-5 py-3.5 bg-card hover:bg-muted/40 hover:no-underline font-semibold text-foreground text-sm">
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#E5484D] flex-shrink-0" />
+                  Risk Map
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="px-5 pb-4 pt-2 bg-card">
+                <RiskMapBar score={result.score} />
+              </AccordionContent>
+            </AccordionItem>
+
+            {/* Category Breakdown */}
+            <AccordionItem
+              value="category-breakdown"
+              className="border border-border rounded-xl overflow-hidden shadow-sm"
+            >
+              <AccordionTrigger className="px-5 py-3.5 bg-card hover:bg-muted/40 hover:no-underline font-semibold text-foreground text-sm">
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#3A5F7D] flex-shrink-0" />
+                  Category Breakdown
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="px-5 pb-4 pt-2 bg-card">
+                <CategoryBreakdownSection categories={categoryData} />
+              </AccordionContent>
+            </AccordionItem>
+
+            {/* Top Liability Gaps */}
+            <AccordionItem
+              value="top-gaps"
+              className="border border-border rounded-xl overflow-hidden shadow-sm"
+            >
+              <AccordionTrigger className="px-5 py-3.5 bg-card hover:bg-muted/40 hover:no-underline font-semibold text-foreground text-sm">
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#E5484D] flex-shrink-0" />
+                  Top Liability Gaps
+                  {gapItems.length > 0 && (
+                    <span className="ml-1 text-xs font-normal text-muted-foreground">
+                      ({gapItems.length} identified)
+                    </span>
+                  )}
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="px-5 pb-4 pt-2 bg-card">
+                <LiabilityGapsSection gaps={gapItems} />
+              </AccordionContent>
+            </AccordionItem>
+
+            {/* Liability Interpretation */}
+            <AccordionItem
+              value="interpretation"
+              className="border border-border rounded-xl overflow-hidden shadow-sm"
+            >
+              <AccordionTrigger className="px-5 py-3.5 bg-card hover:bg-muted/40 hover:no-underline font-semibold text-foreground text-sm">
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#3A5F7D] flex-shrink-0" />
+                  Liability Interpretation
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="px-5 pb-4 pt-2 bg-card">
+                <InterpretationCard text={result.interpretation} withCard={false} />
+              </AccordionContent>
+            </AccordionItem>
+
+            {/* Advisor Insight */}
+            <AccordionItem
+              value="advisor-insight"
+              className="border border-border rounded-xl overflow-hidden shadow-sm"
+            >
+              <AccordionTrigger className="px-5 py-3.5 bg-card hover:bg-muted/40 hover:no-underline font-semibold text-foreground text-sm">
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-amber-500 flex-shrink-0" />
+                  Advisor Insight
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="px-5 pb-4 pt-2 bg-card">
+                <AdvisorInsightCard
+                  advisorSummary={result.advisorSummary}
+                  topGaps={result.topGaps}
+                  withCard={false}
+                />
+              </AccordionContent>
+            </AccordionItem>
+
+            {/* Priority Risk Reduction Plan */}
+            <AccordionItem
+              value="priority-actions"
+              className="border border-border rounded-xl overflow-hidden shadow-sm"
+            >
+              <AccordionTrigger className="px-5 py-3.5 bg-card hover:bg-muted/40 hover:no-underline font-semibold text-foreground text-sm">
+                <span className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-[#E5484D] flex-shrink-0" />
+                  Priority Risk Reduction Plan
+                  {result.immediateActionPlan.length > 0 && (
+                    <span className="ml-1 text-xs font-normal text-muted-foreground">
+                      ({result.immediateActionPlan.length} actions)
+                    </span>
+                  )}
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="px-5 pb-4 pt-2 bg-card">
+                <ActionPlanSection
+                  actions={result.immediateActionPlan}
+                  sectionId="priority-actions"
+                />
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+
+          {/* -- Section 8: Service Cards (gap-map-driven, pasted_content_36 §4-§6) */}
+          <ServiceCardsSection
+            topGaps={result.topGaps}
+            onServiceCTA={(service) => navigate(`/how-we-help#${service}`)}
+          />
+
+          {/* ── Section 9: Final CTA ──────────────────────────────────────────── */}
+          <FinalCTABanner
+            classification={result.classification}
+            riskColor={result.riskMap.color}
+            primaryLabel={planVisited ? "View Defensibility Plan" : "Generate Your Defensibility Plan"}
+            onPrimary={handleDefensibilityPlan}
+            onSecondary={handleExportReport}
+          />
+
+          {/* CRM payload is available via engine output for API/automation use — not shown in UI */}
+        </div>
+      )}
+    </div>
+  );
+}
